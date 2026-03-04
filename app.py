@@ -1,605 +1,512 @@
 """
-Paracetamol Document QA System - RAG Application (FULLY CORRECTED)
-Uses Groq API (100% FREE) with HuggingFace embeddings
-Built with Streamlit, LangChain, and Groq
+Paracetamol Document QA System - RAG Application (OLLAMA VERSION)
+100% LOCAL — No API keys. Auto-detects installed models for embeddings.
+Works with only llama3 installed — no nomic-embed-text required.
 """
 
 import streamlit as st
 import os
 import tempfile
 import logging
-from typing import List, Optional
-from pathlib import Path
+import requests
+import json
+from typing import List
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain.llms.base import LLM
-from dotenv import load_dotenv
 
-# Suppress TensorFlow logs
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # ============================================================================
-# CONFIGURATION & ENVIRONMENT SETUP
+# CONFIG
 # ============================================================================
 
-# Load environment variables from .env file
-load_dotenv()
+OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-# Get API Keys
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-
-# Configuration constants
 CONFIG = {
     "chunk_size": 1000,
     "chunk_overlap": 200,
-    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "llm_provider": "groq",  # "groq", "openai", or "huggingface"
-    "llm_model": "llama-3.3-70b-versatile",  # ✅ UPDATED - New Groq model
+    "llm_model": "llama3:latest",
+    "embedding_model": "llama3:latest",
+    "embedding_mode": "ollama",        # "ollama" | "huggingface"
     "temperature": 0.5,
-    "max_tokens": 512,
+    "max_tokens": 1024,
     "retrieval_k": 3,
+    "ollama_url": OLLAMA_BASE_URL,
 }
 
+KNOWN_EMBED_MODELS = [
+    "nomic-embed-text",
+    "mxbai-embed-large",
+    "all-minilm",
+    "snowflake-arctic-embed",
+]
+
+ALL_CHAT_MODELS = [
+    "llama3.2","llama3.1","llama3","llama2","mistral","mistral-nemo",
+    "gemma3","gemma2","gemma","phi4","phi3","qwen2.5","qwen2",
+    "deepseek-r1","deepseek-r1:8b","codellama","neural-chat",
+    "openchat","vicuna","orca-mini",
+]
+
 # ============================================================================
-# GROQ LLM WRAPPER (100% FREE)
+# OLLAMA HELPERS
 # ============================================================================
 
-class GroqLLM(LLM):
+def check_ollama(url):
+    try:
+        return requests.get(f"{url}/api/tags", timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def get_installed(url):
+    try:
+        r = requests.get(f"{url}/api/tags", timeout=5)
+        if r.status_code == 200:
+            return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        pass
+    return []
+
+
+def pull_stream(model, url):
+    with requests.post(f"{url}/api/pull", json={"name": model},
+                       stream=True, timeout=600) as r:
+        for line in r.iter_lines():
+            if line:
+                try: yield json.loads(line)
+                except Exception: pass
+
+
+def best_embed(installed):
+    """Pick best embedding option given what's installed."""
+    # 1. Prefer a dedicated embedding model
+    for m in installed:
+        if any(em in m for em in KNOWN_EMBED_MODELS):
+            return m, "ollama"
+    # 2. Fall back to first installed chat model
+    if installed:
+        return installed[0], "ollama"
+    # 3. Zero Ollama models — use local HuggingFace
+    return "sentence-transformers/all-MiniLM-L6-v2", "huggingface"
+
+
+# ============================================================================
+# CUSTOM EMBEDDINGS — uses ANY Ollama model via /api/embeddings
+# ============================================================================
+
+class OllamaEmbeddings(Embeddings):
     """
-    Custom LLM wrapper for Groq API (100% FREE).
-    Uses Groq's inference API for fast, free responses.
+    Calls Ollama's /api/embeddings endpoint.
+    Every installed Ollama model supports this — no special embed model needed.
     """
-    
-    api_key: str
-    model_name: str = "llama-3.3-70b-versatile"
+    def __init__(self, model: str, base_url: str = "http://localhost:11434"):
+        self.model    = model
+        self.base_url = base_url
+
+    def _embed_one(self, text: str) -> List[float]:
+        r = requests.post(
+            f"{self.base_url}/api/embeddings",
+            json={"model": self.model, "prompt": text},
+            timeout=120,
+        )
+        if r.status_code == 404:
+            raise Exception(
+                f"Model `{self.model}` not found.\n"
+                f"Pull it with:  ollama pull {self.model}"
+            )
+        r.raise_for_status()
+        return r.json()["embedding"]
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        results = []
+        for i, t in enumerate(texts):
+            results.append(self._embed_one(t))
+        return results
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed_one(text)
+
+
+# ============================================================================
+# OLLAMA LLM
+# ============================================================================
+
+class OllamaLLM(LLM):
+    model_name: str = "llama3:latest"
     temperature: float = 0.5
-    max_tokens: int = 512
-    
+    max_tokens: int = 1024
+    base_url: str = "http://localhost:11434"
+
     class Config:
-        """Pydantic config"""
         arbitrary_types_allowed = True
         extra = "allow"
-    
-    def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile", 
-                 temperature: float = 0.5, max_tokens: int = 512, **kwargs):
-        """Initialize Groq LLM"""
-        super().__init__(api_key=api_key, model_name=model_name, 
-                        temperature=temperature, max_tokens=max_tokens, **kwargs)
-    
+
+    def __init__(self, model_name="llama3:latest", temperature=0.5,
+                 max_tokens=1024, base_url="http://localhost:11434", **kwargs):
+        super().__init__(model_name=model_name, temperature=temperature,
+                         max_tokens=max_tokens, base_url=base_url, **kwargs)
+
     @property
-    def _llm_type(self) -> str:
-        return "groq"
-    
-    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-        """Call Groq API"""
+    def _llm_type(self): return "ollama"
+
+    def _call(self, prompt: str, stop=None, **kwargs) -> str:
         try:
-            from groq import Groq
-            
-            client = Groq(api_key=self.api_key)
-            completion = client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+            r = requests.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_predict": self.max_tokens,
+                    },
+                },
+                timeout=300,
             )
-            return completion.choices[0].message.content
-        except ImportError:
-            raise Exception("Groq library not installed. Run: pip install groq")
-        except Exception as e:
-            raise Exception(f"Groq API error: {str(e)}")
-
-# ============================================================================
-# OPENAI LLM WRAPPER (PAID - OPTIONAL)
-# ============================================================================
-
-class OpenAILLM(LLM):
-    """
-    Custom LLM wrapper for OpenAI API (PAID).
-    Optional alternative if you prefer OpenAI.
-    """
-    
-    api_key: str
-    model_name: str = "gpt-3.5-turbo"
-    temperature: float = 0.5
-    max_tokens: int = 512
-    
-    class Config:
-        """Pydantic config"""
-        arbitrary_types_allowed = True
-        extra = "allow"
-    
-    def __init__(self, api_key: str, model_name: str = "gpt-3.5-turbo", 
-                 temperature: float = 0.5, max_tokens: int = 512, **kwargs):
-        """Initialize OpenAI LLM"""
-        super().__init__(api_key=api_key, model_name=model_name, 
-                        temperature=temperature, max_tokens=max_tokens, **kwargs)
-    
-    @property
-    def _llm_type(self) -> str:
-        return "openai"
-    
-    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-        """Call OpenAI API"""
-        try:
-            from openai import OpenAI
-            
-            client = OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+            if r.status_code == 404:
+                raise Exception(
+                    f"Model `{self.model_name}` not found.\n"
+                    f"Run:  ollama pull {self.model_name}"
+                )
+            r.raise_for_status()
+            return r.json().get("response", "").strip()
+        except requests.exceptions.ConnectionError:
+            raise Exception(
+                f"Cannot connect to Ollama at {self.base_url}.\n"
+                "Start it with:  ollama serve"
             )
-            return response.choices[0].message.content
-        except ImportError:
-            raise Exception("OpenAI library not installed. Run: pip install openai")
-        except Exception as e:
-            raise Exception(f"OpenAI API error: {str(e)}")
+
 
 # ============================================================================
-# HUGGINGFACE LLM WRAPPER (FREE - OPTIONAL)
-# ============================================================================
-
-class HuggingFaceInferenceLLM(LLM):
-    """
-    Custom LLM wrapper for HuggingFace Inference API.
-    Free but less reliable (frequent outages).
-    """
-    
-    model_id: str
-    temperature: float = 0.5
-    max_tokens: int = 512
-    hf_token: str = ""
-    
-    class Config:
-        """Pydantic config"""
-        arbitrary_types_allowed = True
-        extra = "allow"
-    
-    def __init__(self, model_id: str, hf_token: str, temperature: float = 0.5, 
-                 max_tokens: int = 512, **kwargs):
-        """Initialize HuggingFace LLM"""
-        super().__init__(model_id=model_id, hf_token=hf_token, 
-                        temperature=temperature, max_tokens=max_tokens, **kwargs)
-    
-    @property
-    def _llm_type(self) -> str:
-        return "huggingface_inference"
-    
-    def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-        """Call HuggingFace Inference API"""
-        try:
-            import requests
-            
-            api_url = f"https://api-inference.huggingface.co/models/{self.model_id}"
-            headers = {"Authorization": f"Bearer {self.hf_token}"}
-            payload = {
-                "inputs": prompt,
-                "parameters": {
-                    "temperature": self.temperature,
-                    "max_new_tokens": self.max_tokens,
-                }
-            }
-            
-            response = requests.post(api_url, headers=headers, json=payload, timeout=120)
-            
-            if response.status_code == 410:
-                raise Exception(f"Model '{self.model_id}' is no longer available on HuggingFace")
-            if response.status_code == 429:
-                raise Exception("Rate limited by HuggingFace")
-            if response.status_code == 503:
-                raise Exception("HuggingFace service unavailable")
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and "generated_text" in result[0]:
-                    return result[0]["generated_text"].strip()
-            elif isinstance(result, dict) and "generated_text" in result:
-                return result["generated_text"].strip()
-            
-            return str(result)
-        except Exception as e:
-            raise Exception(f"HuggingFace API error: {str(e)}")
-
-# ============================================================================
-# STREAMLIT PAGE CONFIGURATION
-# ============================================================================
-
-st.set_page_config(
-    page_title="Paracetamol Research Assistant",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Custom CSS
-st.markdown(
-    """
-    <style>
-    .main {padding: 2rem;}
-    .stExpander {background-color: #f0f2f6;}
-    h1, h2, h3 {color: #1f77b4;}
-    .success-box {background-color: #d4edda; padding: 10px; border-radius: 5px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("💊 Paracetamol Document QA System (RAG)")
-st.markdown(
-    "**Upload a PDF about Paracetamol and ask intelligent questions based on its content.**\n\n"
-    "Powered by LangChain, Groq (FREE), and Retrieval-Augmented Generation (RAG)"
-)
-
-# ============================================================================
-# VALIDATION & CONFIGURATION
-# ============================================================================
-
-def validate_configuration():
-    """Validate that required API keys are present"""
-    provider = CONFIG["llm_provider"]
-    
-    if provider == "groq":
-        if not GROQ_API_KEY:
-            st.error("❌ Groq API Key Missing")
-            st.info(
-                "Get FREE Groq API key:\n\n"
-                "1. Visit: https://console.groq.com\n"
-                "2. Sign up (free, no payment)\n"
-                "3. Copy your API key\n"
-                "4. Add to .env: `GROQ_API_KEY=gsk-...`"
-            )
-            return False
-    elif provider == "openai":
-        if not OPENAI_API_KEY:
-            st.error("❌ OpenAI API Key Missing")
-            st.info(
-                "Get OpenAI API key:\n\n"
-                "1. Visit: https://platform.openai.com/api-keys\n"
-                "2. Create account (requires credit card)\n"
-                "3. Copy your API key\n"
-                "4. Add to .env: `OPENAI_API_KEY=sk-...`"
-            )
-            return False
-    elif provider == "huggingface":
-        if not HF_TOKEN:
-            st.error("❌ HuggingFace Token Missing")
-            st.info(
-                "Get HuggingFace token:\n\n"
-                "1. Visit: https://huggingface.co/settings/tokens\n"
-                "2. Create token (free)\n"
-                "3. Copy your token\n"
-                "4. Add to .env: `HF_TOKEN=hf_...`"
-            )
-            return False
-    
-    return True
-
-# ============================================================================
-# DOCUMENT PROCESSING FUNCTIONS
+# DOCUMENT PROCESSING
 # ============================================================================
 
 def process_document(uploaded_file) -> List[Document]:
-    """Load and process a PDF document into chunks"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_path = tmp_file.name
-
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = tmp.name
     try:
-        loader = PyPDFLoader(tmp_path)
-        documents = loader.load()
-
-        if not documents:
-            raise ValueError("PDF loaded but contains no pages")
-
-        text_splitter = RecursiveCharacterTextSplitter(
+        docs = PyPDFLoader(tmp_path).load()
+        if not docs:
+            raise ValueError("PDF has no readable pages.")
+        return RecursiveCharacterTextSplitter(
             chunk_size=CONFIG["chunk_size"],
             chunk_overlap=CONFIG["chunk_overlap"],
             separators=["\n\n", "\n", " ", ""],
-        )
-        chunks = text_splitter.split_documents(documents)
-        return chunks
-
+        ).split_documents(docs)
     except Exception as e:
-        raise Exception(f"Failed to process PDF: {str(e)}")
-
+        raise Exception(f"PDF processing failed: {str(e)}")
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
-def create_vector_db(chunks: List[Document]) -> FAISS:
-    """Create FAISS vector database from chunks"""
-    try:
-        embeddings = HuggingFaceEmbeddings(
-            model_name=CONFIG["embedding_model"],
+def make_embeddings():
+    mode  = CONFIG["embedding_mode"]
+    model = CONFIG["embedding_model"]
+    if mode == "huggingface":
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(
+            model_name=model,
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
-        vector_db = FAISS.from_documents(chunks, embeddings)
-        return vector_db
-    except Exception as e:
-        raise Exception(f"Failed to create vector database: {str(e)}")
+    return OllamaEmbeddings(model=model, base_url=CONFIG["ollama_url"])
 
 
-def format_docs(docs: List[Document]) -> str:
-    """Format retrieved documents"""
-    return "\n\n".join(doc.page_content for doc in docs)
-
-
-def initialize_llm():
-    """Initialize LLM based on configuration"""
+def create_vector_db(chunks: List[Document]) -> FAISS:
     try:
-        provider = CONFIG["llm_provider"]
-        
-        if provider == "groq":
-            if not GROQ_API_KEY:
-                raise Exception("GROQ_API_KEY not found in environment")
-            llm = GroqLLM(
-                api_key=GROQ_API_KEY,
-                model_name=CONFIG["llm_model"],
-                temperature=CONFIG["temperature"],
-                max_tokens=CONFIG["max_tokens"],
-            )
-        elif provider == "openai":
-            if not OPENAI_API_KEY:
-                raise Exception("OPENAI_API_KEY not found in environment")
-            llm = OpenAILLM(
-                api_key=OPENAI_API_KEY,
-                model_name=CONFIG["llm_model"],
-                temperature=CONFIG["temperature"],
-                max_tokens=CONFIG["max_tokens"],
-            )
-        else:  # huggingface
-            if not HF_TOKEN:
-                raise Exception("HF_TOKEN not found in environment")
-            llm = HuggingFaceInferenceLLM(
-                model_id=CONFIG["llm_model"],
-                hf_token=HF_TOKEN,
-                temperature=CONFIG["temperature"],
-                max_tokens=CONFIG["max_tokens"],
-            )
-        return llm
+        return FAISS.from_documents(chunks, make_embeddings())
     except Exception as e:
-        raise Exception(f"Failed to initialize LLM: {str(e)}")
+        raise Exception(f"Embedding error with `{CONFIG['embedding_model']}`: {str(e)}")
+
+
+def fmt(docs): return "\n\n".join(d.page_content for d in docs)
+
 
 # ============================================================================
-# MAIN APPLICATION UI
+# STREAMLIT APP
 # ============================================================================
 
-# Sidebar
+st.set_page_config(page_title="Paracetamol RAG — Ollama",
+                   page_icon="🦙", layout="wide",
+                   initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+.main {padding: 2rem;}
+h1,h2,h3 {color: #1a1a2e;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🦙 Paracetamol Document QA — Ollama (100% Local)")
+st.markdown("**No API keys · No cloud · No cost.** Upload a PDF, ask questions, get answers.")
+
+# ---- SIDEBAR ----
+
 with st.sidebar:
-    st.header("📋 About")
-    st.info(
-        "This application uses **Retrieval-Augmented Generation (RAG)** to answer "
-        "questions about Paracetamol documents. The system retrieves the most relevant "
-        "document chunks and uses an LLM to generate accurate answers."
+
+    st.header("🔌 Ollama Connection")
+    ollama_url = st.text_input("Host URL:", value=OLLAMA_BASE_URL)
+    CONFIG["ollama_url"] = ollama_url
+
+    running   = check_ollama(ollama_url)
+    installed = get_installed(ollama_url) if running else []
+
+    if running:
+        st.success("✅ Ollama is running")
+        if installed:
+            st.info("📦 Installed: " + " · ".join(f"`{m}`" for m in installed))
+        else:
+            st.warning("⚠️ No models pulled yet.")
+    else:
+        st.error("❌ Ollama not reachable")
+        st.code("ollama serve")
+
+    st.divider()
+
+    # ---- Chat Model ----
+    st.header("🤖 Chat Model")
+    chat_list    = list(dict.fromkeys(installed + ALL_CHAT_MODELS))
+    default_chat = chat_list.index(installed[0]) if installed else 0
+    sel_chat     = st.selectbox("Model:", chat_list, index=default_chat)
+
+    if sel_chat in installed:
+        st.success(f"✅ `{sel_chat}` ready")
+    else:
+        st.warning(f"⚠️ Not installed")
+        if st.button(f"⬇️ Pull `{sel_chat}`", use_container_width=True):
+            with st.status(f"Pulling `{sel_chat}`...", expanded=True) as s:
+                try:
+                    for u in pull_stream(sel_chat, ollama_url):
+                        if u.get("status"): st.write(u["status"])
+                    s.update(label="✅ Done!", state="complete"); st.rerun()
+                except Exception as e:
+                    s.update(label=f"❌ {e}", state="error")
+
+    CONFIG["llm_model"] = sel_chat
+
+    st.divider()
+
+    # ---- Embedding Model ----
+    st.header("🔢 Embedding Model")
+
+    auto_embed_model, auto_embed_mode = best_embed(installed)
+
+    embed_opts   = []
+    embed_labels = []
+
+    for m in installed:
+        embed_opts.append(("ollama", m))
+        lbl = f"🦙 {m}"
+        if any(em in m for em in KNOWN_EMBED_MODELS):
+            lbl += " ⭐"
+        embed_labels.append(lbl)
+
+    # Always include HuggingFace fallback — works with zero extra pulls
+    embed_opts.append(("huggingface", "sentence-transformers/all-MiniLM-L6-v2"))
+    embed_labels.append("🤗 HuggingFace all-MiniLM-L6-v2 (no pull needed) ✅")
+
+    # Default to auto-detected best
+    def_embed_idx = len(embed_opts) - 1  # default to HuggingFace (always works)
+    for i, (mode, model) in enumerate(embed_opts):
+        if model == auto_embed_model and mode == auto_embed_mode:
+            def_embed_idx = i
+            break
+
+    sel_embed_idx = st.selectbox(
+        "Embedding source:",
+        range(len(embed_labels)),
+        format_func=lambda i: embed_labels[i],
+        index=def_embed_idx,
+        help=(
+            "Any installed Ollama model works for embeddings (⭐ = dedicated embed model, best quality). "
+            "HuggingFace option needs no extra pull and always works."
+        ),
     )
 
-    st.header("⚙️ System Configuration")
+    em_mode, em_model = embed_opts[sel_embed_idx]
+    CONFIG["embedding_model"] = em_model
+    CONFIG["embedding_mode"]  = em_mode
+
+    if em_mode == "huggingface":
+        st.info("🤗 Using local HuggingFace — no Ollama pull required.")
+    else:
+        st.success(f"✅ `{em_model}` ready for embeddings")
+
+    with st.expander("⬇️ Pull a dedicated embed model (better quality)"):
+        for em in KNOWN_EMBED_MODELS:
+            c1, c2 = st.columns([3, 1])
+            c1.write(f"`{em}`")
+            mark = "✅" if any(em in m for m in installed) else "Pull"
+            if c2.button(mark, key=f"pull_em_{em}"):
+                with st.status(f"Pulling `{em}`...", expanded=True) as s:
+                    try:
+                        for u in pull_stream(em, ollama_url):
+                            if u.get("status"): st.write(u["status"])
+                        s.update(label="✅ Done!", state="complete"); st.rerun()
+                    except Exception as e:
+                        s.update(label=f"❌ {e}", state="error")
+
+    st.divider()
+
+    st.header("🌡️ Generation Settings")
+    CONFIG["temperature"] = st.slider("Temperature", 0.0, 1.0, CONFIG["temperature"], 0.1)
+    CONFIG["max_tokens"]  = st.slider("Max Tokens", 256, 4096, CONFIG["max_tokens"], 256)
+    CONFIG["retrieval_k"] = st.slider("Top-K Chunks", 1, 10, CONFIG["retrieval_k"], 1)
+    CONFIG["chunk_size"]  = st.slider("Chunk Size", 200, 2000, CONFIG["chunk_size"], 100)
+
+    st.divider()
+    st.info("**100% Local**\n\n• No API keys\n• No billing\n• Data stays on device")
     st.json(CONFIG)
-    
-    st.header("🔑 API Status")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if GROQ_API_KEY:
-            st.success("✅ Groq API")
-        else:
-            st.warning("⚠️ Groq API")
-    with col2:
-        if OPENAI_API_KEY:
-            st.success("✅ OpenAI")
-        else:
-            st.warning("⚠️ OpenAI")
-    with col3:
-        if HF_TOKEN:
-            st.success("✅ HuggingFace")
-        else:
-            st.warning("⚠️ HuggingFace")
-    
-    # Model selector in sidebar
-    st.header("🤖 Model Selection")
-    available_groq_models = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama3-70b-8192",
-        "llama3-8b-8192",
-        "gemma2-9b-it",
-        "compound-beta",
-    ]
-    selected_model = st.selectbox(
-        "Select Groq Model:",
-        available_groq_models,
-        index=0,
-        help="Choose the LLM model for generating answers"
-    )
-    CONFIG["llm_model"] = selected_model
 
-# Validate configuration
-if not validate_configuration():
+# ---- MAIN ----
+
+if not running:
+    st.error("🚨 Ollama not running.\n```bash\nollama serve\n```")
     st.stop()
 
-# Main content
-uploaded_file = st.file_uploader(
-    "📁 Upload Paracetamol PDF Document",
-    type="pdf",
-    help="Select a PDF file containing Paracetamol-related documentation",
-)
+uploaded_file = st.file_uploader("📁 Upload Paracetamol PDF", type="pdf")
 
 if uploaded_file:
-    # Process document
-    if "vector_db" not in st.session_state or "current_file" not in st.session_state or st.session_state.current_file != uploaded_file.name:
-        with st.spinner("🔄 Processing document and creating embeddings..."):
+    cache_key = f"{uploaded_file.name}__{em_model}__{em_mode}"
+
+    if st.session_state.get("cache_key") != cache_key:
+        embed_lbl = f"🤗 `{em_model}`" if em_mode == "huggingface" else f"🦙 `{em_model}`"
+        with st.spinner(f"🔄 Chunking & embedding with {embed_lbl}..."):
             try:
                 chunks = process_document(uploaded_file)
-                st.session_state.vector_db = create_vector_db(chunks)
-                st.session_state.current_file = uploaded_file.name
+                st.session_state.vector_db   = create_vector_db(chunks)
+                st.session_state.cache_key   = cache_key
                 st.session_state.chunk_count = len(chunks)
-                st.success(
-                    f"✅ Document indexed successfully! **{len(chunks)} chunks** created"
-                )
+                st.success(f"✅ Indexed **{len(chunks)} chunks** · Embeddings: {embed_lbl}")
             except Exception as e:
-                st.error(f"❌ Error processing document:\n{str(e)}")
+                st.error(f"❌ {e}")
                 st.stop()
     else:
-        st.success(f"✅ Document already indexed! **{st.session_state.chunk_count} chunks** available")
+        st.success(
+            f"✅ Already indexed **{st.session_state.chunk_count} chunks** "
+            f"from `{uploaded_file.name}`"
+        )
 
-    # Query input
     query = st.text_input(
         "❓ Ask a question about Paracetamol:",
         placeholder="e.g., What are the side effects of Paracetamol?",
-        help="Type your question based on the uploaded document",
     )
 
     if query:
-        with st.spinner("🔍 Searching for answers..."):
+        with st.spinner(f"🦙 Running `{CONFIG['llm_model']}`..."):
             try:
-                # Initialize LLM
-                llm = initialize_llm()
-
-                # Create retriever
+                llm = OllamaLLM(
+                    model_name=CONFIG["llm_model"],
+                    temperature=CONFIG["temperature"],
+                    max_tokens=CONFIG["max_tokens"],
+                    base_url=CONFIG["ollama_url"],
+                )
                 retriever = st.session_state.vector_db.as_retriever(
                     search_kwargs={"k": CONFIG["retrieval_k"]}
                 )
+                prompt = ChatPromptTemplate.from_template("""You are an expert assistant for Paracetamol questions.
 
-                # Prompt template
-                prompt_template = """You are an expert assistant specialized in answering questions about Paracetamol.
+Instructions:
+1. Use ONLY the provided context to answer
+2. If not in context, say you don't know
+3. Be accurate and concise
 
-Your task:
-1. Use ONLY the provided context to answer the question
-2. If the answer is not in the context, clearly state you don't know
-3. Provide accurate, clear, and concise answers
-4. Cite specific information from the context when relevant
-
-Context from document:
+Context:
 {context}
 
 Question: {question}
 
-Answer:"""
-
-                prompt = ChatPromptTemplate.from_template(prompt_template)
-
-                # Build RAG chain
+Answer:""")
                 chain = (
-                    {
-                        "context": retriever | format_docs,
-                        "question": RunnablePassthrough(),
-                    }
-                    | prompt
-                    | llm
-                    | StrOutputParser()
+                    {"context": retriever | fmt, "question": RunnablePassthrough()}
+                    | prompt | llm | StrOutputParser()
                 )
-
-                # Generate answer
                 answer = chain.invoke(query)
-                source_docs = retriever.invoke(query)
+                src    = retriever.invoke(query)
 
-                # Display results
+                st.markdown(
+                    f"<span style='background:linear-gradient(90deg,#1a1a2e,#16213e);"
+                    f"color:white;padding:3px 14px;border-radius:12px;"
+                    f"font-size:0.8rem;font-weight:bold;'>"
+                    f"🦙 Ollama — {CONFIG['llm_model']}</span>",
+                    unsafe_allow_html=True,
+                )
                 st.subheader("📝 Answer:")
                 st.write(answer)
 
-                st.subheader(f"📚 Source Chunks (Top {CONFIG['retrieval_k']} Matches):")
-                for i, doc in enumerate(source_docs, 1):
-                    page_num = doc.metadata.get("page", "Unknown")
-                    with st.expander(f"Chunk {i} — Page {page_num}"):
+                st.subheader(f"📚 Source Chunks (Top {CONFIG['retrieval_k']}):")
+                for i, doc in enumerate(src, 1):
+                    with st.expander(f"Chunk {i} — Page {doc.metadata.get('page','?')}"):
                         st.write(doc.page_content)
 
                 st.info(
-                    f"ℹ️ Retrieved {len(source_docs)} most relevant document chunks using model: **{CONFIG['llm_model']}**"
+                    f"ℹ️ {len(src)} chunks · Chat: **{CONFIG['llm_model']}** · "
+                    f"Embed: **{CONFIG['embedding_model']}** ({CONFIG['embedding_mode']})"
                 )
-
             except Exception as e:
-                st.error(f"❌ Error processing query:\n{str(e)}")
-                with st.expander("📋 Error Details"):
-                    import traceback
-                    st.code(traceback.format_exc(), language="python")
+                st.error(f"❌ {e}")
+                with st.expander("📋 Traceback"):
+                    import traceback; st.code(traceback.format_exc(), language="python")
 
-    # System architecture
-    with st.expander("⚙️ System Architecture Details"):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("Document Chunking")
-            st.write(f"- **Chunk Size:** {CONFIG['chunk_size']} tokens")
-            st.write(f"- **Chunk Overlap:** {CONFIG['chunk_overlap']} tokens")
-            st.write("- **Splitter:** RecursiveCharacterTextSplitter")
-
-            st.subheader("Embeddings Model")
-            st.write(f"- **Model:** {CONFIG['embedding_model']}")
-            st.write("- **Vector Store:** FAISS")
-            st.write("- **Normalized:** Yes")
-
-        with col2:
-            st.subheader("LLM Configuration")
-            st.write(f"- **Provider:** {CONFIG['llm_provider'].upper()}")
-            st.write(f"- **Model:** {CONFIG['llm_model']}")
-            st.write(f"- **Temperature:** {CONFIG['temperature']}")
-            st.write(f"- **Max Tokens:** {CONFIG['max_tokens']}")
-            st.write(f"- **Retrieval K:** {CONFIG['retrieval_k']}")
-
-        st.divider()
-
-        st.subheader("📊 RAG Pipeline")
-        st.write(
-            """
-            1. **Document Loading**: PDF is loaded and parsed
-            2. **Chunking**: Document is split into overlapping chunks
-            3. **Embedding**: Chunks are converted to embeddings using HuggingFace
-            4. **Vector Storage**: Embeddings are stored in FAISS
-            5. **Retrieval**: User query retrieves top-k similar chunks
-            6. **LLM Generation**: Groq/OpenAI/HuggingFace generates answer
-            7. **Output**: Answer and source chunks displayed
-            """
-        )
+    with st.expander("⚙️ Architecture"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write(f"**Chunk Size:** {CONFIG['chunk_size']} · **Overlap:** {CONFIG['chunk_overlap']}")
+            st.write(f"**Embedding:** `{CONFIG['embedding_model']}` ({CONFIG['embedding_mode']})")
+            st.write("**Vector Store:** FAISS")
+        with c2:
+            st.write(f"**Engine:** Ollama · **Model:** `{CONFIG['llm_model']}`")
+            st.write(f"**Temp:** {CONFIG['temperature']} · **Max Tokens:** {CONFIG['max_tokens']}")
 
 else:
-    st.info("👆 **Upload a PDF file to get started**")
-    st.markdown(
-        """
-        ### 🚀 Getting Started:
-        1. Click the **Upload Paracetamol PDF** button above
-        2. Select your PDF document
-        3. Wait for document processing and indexing
-        4. Ask questions about the document content
-        5. Review the answers and source chunks
-        
-        ### 🔑 API Configuration (Choose ONE):
-        - **Groq** (Recommended): FREE, fast - https://console.groq.com
-        - **OpenAI**: PAID, reliable - https://platform.openai.com
-        - **HuggingFace**: FREE, less reliable - https://huggingface.co
-        
-        ### 🤖 Available Groq Models (All FREE):
-        | Model | Description |
-        |-------|-------------|
-        | `llama-3.3-70b-versatile` | Best quality, 128K context |
-        | `llama-3.1-8b-instant` | Fastest responses |
-        | `llama3-70b-8192` | High quality, 8K context |
-        | `llama3-8b-8192` | Fast & lightweight |
-        | `gemma2-9b-it` | Google's model |
-        """
-    )
+    st.info("👆 Upload a PDF to get started")
+    st.markdown("""
+### 🚀 Setup
 
-# Footer
+```bash
+# Install & start Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve
+
+# Pull a chat model (required)
+ollama pull llama3
+
+# Optional — dedicated embedding model (better quality)
+ollama pull nomic-embed-text
+
+# Python deps
+pip install streamlit langchain langchain-community faiss-cpu \\
+            pypdf requests python-dotenv sentence-transformers
+
+# Run
+streamlit run paracetamol_ollama_rag.py
+```
+
+### 💡 Embedding Options
+| Option | Needs Pull? | Quality |
+|---|---|---|
+| 🤗 HuggingFace all-MiniLM | ❌ No | Good |
+| 🦙 `llama3:latest` (chat model) | Already installed | Good |
+| ⭐ `nomic-embed-text` | ✅ Yes | Best |
+""")
+
 st.markdown("---")
 st.markdown(
-    """
-    <div style='text-align: center; color: gray;'>
-        <p>💊 Paracetamol Document QA System | Built with Streamlit, LangChain & Groq</p>
-        <p>Using Model: <strong>{}</strong></p>
-    </div>
-    """.format(CONFIG["llm_model"]),
+    f"<div style='text-align:center;color:gray;'>"
+    f"🦙 Ollama RAG · Chat: <strong>{CONFIG['llm_model']}</strong> · "
+    f"Embed: <strong>{CONFIG['embedding_model']}</strong> ({CONFIG['embedding_mode']})</div>",
     unsafe_allow_html=True,
 )
